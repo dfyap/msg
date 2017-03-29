@@ -1,0 +1,559 @@
+---
+title: "MSG analyses"
+author: "Defu Yap, Geoffrey Brookshire, Daniel Casasanto"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = FALSE) # Don't print the R code
+# knitr::opts_chunk$set(cache=FALSE)
+
+source('stratified.R') # Requires data.table
+library(knitr) # For pretty tables in the text (also pander or xtable)
+library(parallel) # for parSapply
+library(permute) # For within-subjects randomization: how() & shuffle()
+library(analysisHelpers) # For fix.factors
+library(ggplot2)
+library(plotrix)
+
+# Calculate the number of cores for parallel processing
+ncores <- detectCores() - 1
+# Initiate cluster
+cl <- makeCluster(ncores)
+
+```
+
+# Introduction
+
+Let's use this script to gather together all the analyses and to generate the plots.
+
+# Method
+
+## Data cleaning
+
+Before all analysis, we excluded non-gestures and emblems. We also excluded gestures that were not produced in the four directions of the stories.
+
+``` {r cleanData}
+
+df <- read.csv('data/msgclause.csv')
+df$Sub <- factor(paste(df$Sub, df$experiment, sep ='_')) # tag experiment to sub
+names(df)[names(df) == 'direction'] <- 'gestureDirection' # rename gesture directions
+
+# Which variables do we care about?
+lang.type <- 'Input.Lang' # 'Output.Language'
+direction.var <- 'StoryDirection' # 'ClauseDirection'
+
+# exclude non-gestures and emblems
+msg <- df[which(df$storyGesture != "" 
+                 & df$storyGesture != "ADAPTOR"
+                 & df$storyGesture != 'EMBLEM'
+                 & df$storyGesture != "NA "),] 
+msg$storyGesture <- factor(msg$storyGesture)
+
+# include only gestures produced in four directions of the stories
+msg <- subset(msg, gestureDirection %in% c('UP','DOWN','LEFT','RIGHT'))
+msg$gestureDirection <- factor(tolower(msg$gestureDirection)) 
+msg$gestureDirection <- factor(msg$gestureDirection, levels = c('right','up','left','down'))
+
+# select subset of intest
+# msg <- subset(msg, Target.NonTarget == 'NonTarget') 
+#df$Output.Language <- factor(paste(df$Output.Language, "SL", sep ='')) # tag experiment to sub
+#table(df$Output.Language)
+
+```
+
+## Analysis
+
+We computed congruity as the proportion of gestures that were in the same direction as the dominant direction of the story.
+
+``` {r congruityFunc}
+
+# Calculate the proportion of congruent gestures in a data.frame
+Congruity <- function(dat) {
+  mean(dat[[direction.var]] == dat$gestureDirection)
+}
+
+# Function to help report the results.
+# Makes a string reporting the stats for this test.
+# Args
+# emp: an empirical value
+# perm.dist: a permuted distribution
+ReportPermute <- function(emp, perm.dist) {
+  pval <- mean(perm.dist > emp)
+  paste('(', round(mean(perm.dist), 3) * 100,
+      ' $\\pm$ ', round(sd(perm.dist), 3) * 100,
+      '%, p = ', pval, ')',
+      sep='')
+}
+
+```
+
+### Overall congruity
+
+Since there were four possible directions of interest, it would be tempting to treat 25\% as chance. However,  participants produced unequal numbers of gestures in each direction and each story type, therefore we cannot compare our data against an a priori chance value. To test whether gestures were congruent with the story direction more often than would be expected by chance, we performed within-subjects permutation tests. In each permutation, we randomly shuffled the story direction within each participant's data 10,000 times, and then computed the congruity over the shuffled data. The permuted distributions are reported as Mean $\pm$ SD.
+
+``` {r overallPermuteFunc}
+clusterExport(cl, c('shuffle', 'Congruity', 'how', 'msg'))
+
+# Within-subjects permutation test on proportion of congr. gestures.
+WithinSubsCongPermute <- function(dat, n.reps=10000){
+  CTRL <- how(blocks = dat$Sub) 
+  PermHelper <- function() {
+    shuff.inx <- shuffle(nrow(dat), control = CTRL) # shuffle indices within Sub
+    dat[[direction.var]] <- dat[[direction.var]][shuff.inx]
+    return(Congruity(dat)) # calculate mean congruence across all Sub
+  }
+  parSapply(cl, 1:n.reps, function(x) PermHelper()) # Parallel
+  # replicate(n.reps, expr = PermHelper())
+}
+
+```
+
+### Differences in congruity between visibility conditions
+
+We performed a permutation test to determine whether the mean proportion of congruity differs between the different visibility conditions. We computed the variance of the proportion congruity between the three groups, and then randomly shuffled the visibility (experiment) label for each trial ($k = 10,000$).
+
+```{r onewayAnovaPermuteFunc}
+# Oneway permutation functions
+
+# Compute the means for each input language; get the variance of those means.
+GroupVar <- function(dat, IV) {
+  group.means <- by(dat, dat[[IV]], Congruity)
+  return(var(group.means))
+}
+
+# Permutation test analogous to a one-way ANOVA.
+# Are the differences in congruity between groups greater than chance?
+# F.K.A. WithinSubsCongExpVarPermute
+OnewayPermTest <- function(dat, IV, n.reps=10000){
+  PermHelper <- function() {
+    CTRL <- how(blocks = dat$Sub)
+    shuff.inx <- shuffle(nrow(dat), control = CTRL) # shuffle indices within Sub
+    dat[[IV]] <- dat[[IV]][shuff.inx]
+    return(GroupVar(dat, IV)) # calculate mean congruence across all Sub
+  }
+  # replicate(n=n.reps, expr=PermHelper(dat))
+  parSapply(cl, 1:n.reps, function(x) PermHelper()) # Parallel
+}
+
+# Report variance in the means of congruity
+ReportOnewayPerm <- function(emp, perm.dist) {
+  pval <- mean(perm.dist > emp)
+  paste('( M = ', round(mean(perm.dist), 5) * 100,
+      ' $\\pm$ ', round(sd(perm.dist), 5) * 100,
+      '%, p = ', round(pval,3), ')',
+      sep='')
+}
+
+```
+
+We performed three separate permutation tests (k=10,000, each) to compare the pairwise differences in gesture congruity between each pair of visibility conditions. We randomly permuted the story directions within each participant, and computed the pairwise differences in congruity. 
+
+``` {r pairwisePermuteFunc}
+
+# Compute the pairwise difference in congruity between groups.
+PairwiseDiffHelper <- function(dat, IV, name1, name2) {
+  c1 <- Congruity(dat[dat[[IV]] == name1,])
+  c2 <- Congruity(dat[dat[[IV]] == name2,])
+  return(c1 - c2)
+}
+
+# Within-subjects permutation test on pairwise differences.
+WithinSubsCongPairwisePermute <- function(dat, IV, name1, name2, n.reps=10000){
+  PermHelper <- function() {
+    CTRL <- how(blocks = dat$Sub)
+    shuff.inx <- shuffle(nrow(dat), control = CTRL) # shuffle indices within Sub
+    dat[[IV]] <- dat[[IV]][shuff.inx]
+    return(PairwiseDiffHelper(dat, IV, name1, name2))
+  }
+  parSapply(cl, 1:n.reps, function(x) PermHelper())
+}
+
+```
+
+We performed within-subjects permutations ($k=10,000$) to test whether congruity within each visibility condition was greater than would be expected by chance. 
+
+### Congruity within each story direction
+
+We performed bootstrapping tests ($k=1000$) to test whether congruity for each story direction was greater than would be expected by chance. To determine the chance level of congruity, we sampled gestures with replacement within each subject but across all story directions. To ensure that each subject had the same influence over the final congruity estimate, we sampled the same number of gestures as each subject produced in that story direction. We then compared the observed rate of congruity between the observed and predicted gesture directions against the chance level, established by bootstrapping. Effect sizes were reported in odds ratios and their confidence intervals.
+ 
+``` {r singleDirectionBootFunc}
+clusterExport(cl, c('stratifiedDT', 'setnames', 'setkeyv',
+                    'is.data.table', 'as.data.table', 'data.table'))
+
+# Bootstrap test on proportion of congruent gestures in one story direction.
+BootSingleDirection <- function(dat, story.direction, n.reps=1000) {
+  
+  # First figure out how many samples to draw for each subject
+  n.samps.per.subj <- aggregate(X ~ Sub, data=dat[dat[[direction.var]] == story.direction,],
+                                FUN=length)
+  counts <- n.samps.per.subj$X
+  names(counts) <- n.samps.per.subj$Sub
+  
+  BootSampHelper <- function() {
+    # Sample with replacement from within each group
+    # Take the same number of observations as there 
+    # are for each story direction.
+    # Be sure to only look at subjects who had > 0 gestures in this cond.
+    resamp.dat <- stratifiedDT(subset(dat, Sub %in% n.samps.per.subj$Sub),
+                               group = 'Sub',
+                               size = counts,
+                               replace = TRUE)
+    
+    # Get the bootstrapped congruence with this story direction
+    resamp.dat[[direction.var]] <- story.direction
+    c.resamp <- Congruity(resamp.dat)
+    return(c.resamp)
+  }
+  
+  # replicate(n=n.reps, expr=BootSampHelper())
+  parSapply(cl, 1:n.reps, function(x) BootSampHelper())
+  
+  # return mean congruity within each story direction
+  
+}
+
+# Report the bootstrap results.
+ReportBootstrap <- function(emp, c.resamp) {
+  pval <- mean(c.resamp > emp)
+  paste('(', round(mean(c.resamp), 3) * 100,
+      ' $\\pm$ ', round(sd(c.resamp), 3) * 100,
+      '%, p = ', pval, ')',
+      sep='')
+}
+
+# Odds ratio of selected gesture and story direction.
+ReportOddsRatio <- function(data, direc) {
+  sel.gest.dir <- data$gestureDirection == direc # Selected gesture direction
+  sel.story.dir <- data[[direction.var]] == direc # Selected story direction
+  x <- table(sel.gest.dir, sel.story.dir)
+  or <- fisher.test(x)
+  paste('OR = ', round(or$estimate, 2),
+        ', p = ', round(or$p.value,6),
+        ', 95% CI [', round(or$conf.int[1],2),  
+        ', ', round(or$conf.int[2],2), ']',
+        sep='')
+}
+
+```
+
+### Differences in congruity between input language types
+
+We performed a permutation test to determine whether the mean proportion of congruity differs between the different types of input language. We computed the variance of the proportion congruity between the three groups, and then randomly shuffled the input language label for each trial ($k = 10,000$).
+
+We performed three separate permutation tests (k=10,000, each) to compare the pairwise differences in gesture congruity between each pair of language types. We randomly permuted the story directions within each participant, and computed the pairwise differences in congruity.
+
+We performed within-subjects permutations ($k=10,000$) to test whether congruity within each language type was greater than would be expected by chance. 
+
+### Differences in congruity with respect to the presence of directional meaning in clauses. 
+
+We performed a permutation test (k=10,000) to compare the pairwise differences in gesture congruity between each pair of clause types. We randomly permuted the story directions within each participant, and computed the pairwise differences in congruity. Then we performed within-subjects permutations tests to test whether congruity within each type of clause (Target vs. Non-target clause) was greater than would be expected by chance ($k=10,000$).
+
+# Results (Combined data)
+
+## Descriptive statistics
+
+``` {r allGestureDescriptives, cache=FALSE}
+clusterExport(cl, c('msg','direction.var', 'BootSingleDirection'))
+
+# Counts and proportions of all types of gestures
+#addmargins(table(dat$storyGesture)) # check gest counts
+#round(prop.table(table(dat$storyGesture)),4) # check gestproportions
+counts <- summary(df$storyGesture)[1:6]
+bar.names <- names(counts)
+b1 <- barplot(height = counts,
+        names.arg = bar.names,
+        las = 2,
+        col = 'blue',
+        cex.names = 0.8, ylim = c(0,max(counts)+500),
+        main = 'Total number of gestures produced',
+        ylab = 'Count')
+text(x = b1, y = counts, label = counts, pos = 3, cex = 0.8)
+rm(counts, bar.names)
+
+# Counts and proportions of gestures in all directions
+counts <- summary(df$gestureDirection)[1:11] # exclude NAs
+bar.names <- names(counts)
+b2 <- barplot(height = counts,
+        names.arg = bar.names,
+        las = 2,
+        col = 'blue',
+        cex.names = 0.8, ylim = c(0,max(counts)+500),
+        main = 'Total number of gestures produced',
+        ylab = 'Count')
+## Add text at top of bars
+text(x = b2, y = counts, label = counts, pos = 3, cex = 0.8)
+rm(counts, bar.names)
+
+# plot gesture counts according to gesture direction
+bartable = table(msg$gestureDirection, msg$storyGesture)  
+b3 <- barplot(bartable, beside = TRUE, 
+              col = c('blue','red','brown','orange'),
+              main = 'Total number of gestures produced',
+              ylim = c(0,max(bartable)+500), ylab = 'Count',
+              legend = levels(unique(msg$gestureDirection))) 
+## Add text at top of bars
+text(x = b3, y = bartable, label = bartable, pos = 3, cex = 0.8)
+
+# barplot by proportions
+bartable = prop.table(table(msg$gestureDirection, msg[[direction.var]]),2)  
+b4 <- barplot(bartable, beside = TRUE, 
+              col = c('blue','red','brown','orange'),
+              ylim = c(0,1), ylab = 'Proportions of gestures',
+             xlab = 'Story directions',
+              legend = levels(unique(msg$gestureDirection)),
+             args.legend = list(title='gesture\ndirections', bty = 'n'))
+## Add text at top of bars
+text(x = b4, y = bartable, label = round(bartable,2), pos = 3, cex = 0.8)
+
+# Calculate empirical and permuted congruity in each language type and storydirection 
+summ.perm <- by(msg, msg[[lang.type]], FUN = function(d) {
+  dirs <- levels(d[[direction.var]])
+  bs <- lapply(dirs, FUN = function(direc) {
+    list(perm=BootSingleDirection(d, direc, n.reps=100), # Bootstrapped chance cong
+         emp=Congruity(d[d[[direction.var]] == direc,])) # Empirical cong
+    })
+  names(bs) <- dirs # Make sure we know which story direction is which
+  return(bs)
+})
+
+#Init plot
+plot(NULL, NULL, ylim = c(0,1), xlim = c(1, 14),
+     xlab='Story', xaxt='n', ylab='Congruity')
+
+box.pos <- c(1:4, 6:9, 11:14) # Keep track of where the box will be
+i.box <- 1
+
+axis(side = 1, labels = levels(msg[[lang.type]]),
+     at = c(2.5, 7.5, 12.5), # line = 2,
+     lty=0)
+
+# do a 'dictionary' of arrows for their labels
+list.arrows <- list(left ='←', right = '→', up = '↑', down = '↓')
+# text(box.pos, 0.05, rep(uni.arrows, times=3), cex=1.5)
+msg[[direction.var]] <- factor(msg[[direction.var]], levels = c('up','down','left','right'))
+text(box.pos, 0.05, rep(list.arrows[levels(msg[[direction.var]])], times=3), cex=1.5)
+for (languageType in levels(msg[[lang.type]])) {
+  for (direction in levels(msg[[direction.var]])) {
+    boxplot(summ.perm[[languageType]][[direction]]$perm,
+            range = 0,
+            # boxwex = 0.9,
+            staplewex = 0.1, lty = 1,
+            add = TRUE, at = box.pos[i.box], yaxt='n')
+    points(box.pos[i.box], summ.perm[[languageType]][[direction]]$emp,
+           pch=19, col='red')
+    i.box <- i.box + 1
+  }
+}
+
+
+```
+
+### Overall congruity
+
+``` {r overallChanceCongruity, cache=FALSE}
+clusterExport(cl, 'direction.var')
+
+perm.stat <- WithinSubsCongPermute(msg) 
+
+# If we want permutation histograms, here's how we'd do them
+# hist(perm.stat, xlim=c(0,1), col = 'black')
+# abline(v=Congruity(no.barrier), col='red')
+
+```
+
+Across all story types and directions, participants gestured in a direction congruent with the direction of the story `r round(Congruity(msg), 3) * 100` % of the time. This proportion of congruence was higher than would be expected by chance `r ReportPermute(Congruity(msg), perm.stat)`.
+
+``` {r visibilityChanceCongrutiy, cache=FALSE} 
+clusterExport(cl, c('GroupVar', 'PairwiseDiffHelper'))
+
+# Congruity across visibility conditions
+empVar <-GroupVar(msg,'experiment') # empirical value
+permVar.dist <- OnewayPermTest(msg,'experiment') # chance distribution
+
+# Pairwise difference in chance congruity between visibility conditions
+empExp1v3Pair <- PairwiseDiffHelper(msg,'experiment', 'MSG1','MSG3')
+permExp1v3Pair <- WithinSubsCongPairwisePermute(msg,'experiment','MSG1','MSG3') 
+
+empExp1v4Pair <- PairwiseDiffHelper(msg,'experiment', 'MSG1','MSG4')
+permExp1v4Pair <- WithinSubsCongPairwisePermute(msg,'experiment','MSG1','MSG4')
+
+empExp3v4Pair <- PairwiseDiffHelper(msg,'experiment', 'MSG3','MSG4')
+permExp3v4Pair <- WithinSubsCongPairwisePermute(msg,'experiment','MSG3','MSG4') 
+
+# Congruity within each visibility condition
+empExp1 <- Congruity(subset(msg, experiment=='MSG1'))
+permExp1.dist <- WithinSubsCongPermute(subset(msg,experiment == 'MSG1'))
+
+empExp3 <- Congruity(subset(msg, experiment=='MSG3'))
+permExp3.dist <- WithinSubsCongPermute(subset(msg,experiment == 'MSG3'))
+
+empExp4 <- Congruity(subset(msg, experiment=='MSG4'))
+permExp4.dist <- WithinSubsCongPermute(subset(msg,experiment == 'MSG4'))  
+
+```
+
+### Congruity across visibility conditions
+
+In this section, we'll want to include the 'one-way ANOVA' across all three visibility conditions, as well as pairwise permutation tests. Also, include tests of whether congruity is greater than chance in each visibility condition.We randomly permuted the visibility conditions between each participant, and computed the variance of the mean congruity across visibility conditions. The observed variance was `r round(empVar,4)*100`%, which was significantly greater than the permuted chance variance `r ReportOnewayPerm(empVar, permVar.dist)`.
+
+We performed three separate permutation tests (k=10,000, each) between each pair of visibility conditions. We randomly permuted the story directions within each participant, and computed the pairwise differences in congruity. Congruity was higher in the no-barrier than in barrier-only condition (`r empExp1v3Pair*100`%, chance rate = `r ReportPermute(empExp1v3Pair,permExp1v3Pair)`, higher in no-barrier than in the barrier-with-blindfold condition (`r empExp1v4Pair*100`%, chance rate = `r ReportPermute(empExp1v4Pair,permExp1v4Pair)`, and higher in barrier-with-blindfold than the barrier-only condition (`r empExp3v4Pair*100`%, chance rate = `r ReportPermute(empExp3v4Pair,permExp3v4Pair)`.
+
+We performed within-subjects permutations (k=10,000) to test whether congruity within each visibility condition was greater than would be expected by chance. Participants produced congruent gestures more often than would be expected by chance in all three visibility conditions: no-barrier condition: `r round(empExp1, 3) * 100`% congruent  (chance rate = `r ReportPermute(empExp1, permExp1.dist)`); barrier condition: `r round(empExp3, 3) * 100`% congruent (chance rate =  `r ReportPermute(empExp3, permExp3.dist)`) , and barrier-and-blindfold condition: `r round(empExp4, 3) * 100`% congruent (chance rate =  `r ReportPermute(empExp4, permExp4.dist)`).
+
+Since the overall congruity in all three visibility conditions are significantly above chance, we collapsed the visibility conditions for the rest of the analyses.
+
+### Congruity in each direction
+
+``` {r singleDirectionRadialPlots, fig.height=12, fig.width=12}
+
+# Table of gesture-direction produced in each story direction
+# t <- xtabs(~ StoryDirection + gestureDirection, data=msg) # original xtabs
+# t <- xtabs(msg[c(direction.var, 'gestureDirection'),]) # xtabs failed but table works!
+t <- table(msg[c(direction.var, 'gestureDirection')]) 
+# t <- t[,c('right','up','left','down')] #rearrange coloumns for radial.plot 
+
+# Radial plot function for gestures produced in each story direction
+MyRadPlot <- function(x, ...) {
+  radial.plot(x,
+            labels=c('RIGHT','UP','LEFT','DOWN'),
+            rp.type='p',
+            poly.col=c(rgb(1,0,0,.5),rgb(0,1,0,.5)),
+            line.col=c('black','black'),lwd=1,
+            show.grid.labels = 3, boxed.radial = F, bty='n',
+            ...)
+}
+
+# Radial plots of gestures in each story direction
+par(mfrow=c(2,2))
+MyRadPlot(t['down',], radial.lim=c(0, max(t)), main='Downward stories')
+MyRadPlot(t['up',], radial.lim=c(0, max(t)), main='Upward stories')
+MyRadPlot(t['left',], radial.lim=c(0, max(t)), main='Leftward stories')
+MyRadPlot(t['right',], radial.lim=c(0, max(t)), main='Rightward stories')
+
+
+# Radial representation of the same lang.type by direction.var boxplots
+par(mfrow=c(5,5))
+
+# # Function to plot radials for each story direction according to each language type
+# for(languageType in levels(msg[[lang.type]])) {
+#   for(direction in levels(msg[[direction.var]])) {
+#     MyRadPlot(g[,,languageType][direction.var,],
+#               radial.lim=c(0, max(g[,,languageType])), 
+#               main=paste0(direction.var),'ward stories')
+#   }
+# }
+
+g <- table(msg[c(direction.var, 'gestureDirection', lang.type)])
+par(mar = c(0,0,0,0)) # LSL
+plot(c(0, 1), c(0, 1), ann = F, bty = 'n', type = 'n', xaxt = 'n', yaxt = 'n')
+text(x = 0.5, y = 0.5, paste("LSL"), cex = 1.6, col = "black")
+MyRadPlot(g[,,'LSL']['down',], radial.lim=c(0, max(g[,,'LSL'])), main='Downward stories')
+MyRadPlot(g[,,'LSL']['up',], radial.lim=c(0, max(g[,,'LSL'])), main='Upward stories')
+MyRadPlot(g[,,'LSL']['left',], radial.lim=c(0, max(g[,,'LSL'])), main='Leftward stories')
+MyRadPlot(g[,,'LSL']['right',], radial.lim=c(0, max(g[,,'LSL'])), main='Rightward stories')
+
+par(mar = c(0,0,0,0)) # MSL
+plot(c(0, 1), c(0, 1), ann = F, bty = 'n', type = 'n', xaxt = 'n', yaxt = 'n')
+text(x = 0.5, y = 0.5, paste("MSL"), cex = 1.6, col = "black")
+MyRadPlot(g[,,'MSL']['down',], radial.lim=c(0, max(g[,,'MSL'])), main='Downward stories')
+MyRadPlot(g[,,'MSL']['up',], radial.lim=c(0, max(g[,,'MSL'])), main='Upward stories')
+MyRadPlot(g[,,'MSL']['left',], radial.lim=c(0, max(g[,,'MSL'])), main='Leftward stories')
+MyRadPlot(g[,,'MSL']['right',], radial.lim=c(0, max(g[,,'MSL'])), main='Rightward stories')
+
+par(mar = c(0,0,0,0)) # NSL
+plot(c(0, 1), c(0, 1), ann = F, bty = 'n', type = 'n', xaxt = 'n', yaxt = 'n')
+text(x = 0.5, y = 0.5, paste("NSL"), cex = 1.6, col = "black")
+MyRadPlot(g[,,'NSL']['down',], radial.lim=c(0, max(g[,,'NSL'])), main='Downward stories')
+MyRadPlot(g[,,'NSL']['up',], radial.lim=c(0, max(g[,,'NSL'])), main='Upward stories')
+MyRadPlot(g[,,'NSL']['left',], radial.lim=c(0, max(g[,,'NSL'])), main='Leftward stories')
+MyRadPlot(g[,,'NSL']['right',], radial.lim=c(0, max(g[,,'NSL'])), main='Rightward stories')
+
+c <- table(msg[c(direction.var, 'gestureDirection', 'Target.NonTarget')])
+par(mar = c(0,0,0,0)) # Target clauses
+plot(c(0, 1), c(0, 1), ann = F, bty = 'n', type = 'n', xaxt = 'n', yaxt = 'n')
+text(x = 0.5, y = 0.5, paste("Target\nclauses"), cex = 1.6, col = "black")
+MyRadPlot(c[,,'Target']['down',], radial.lim=c(0, max(c[,,'Target'])), main='Downward stories')
+MyRadPlot(c[,,'Target']['up',], radial.lim=c(0, max(c[,,'Target'])), main='Upward stories')
+MyRadPlot(c[,,'Target']['left',], radial.lim=c(0, max(c[,,'Target'])), main='Leftward stories')
+MyRadPlot(c[,,'Target']['right',], radial.lim=c(0, max(c[,,'Target'])), main='Rightward stories')
+
+par(mar = c(0,0,0,0)) # Non-target clauses
+plot(c(0, 1), c(0, 1), ann = F, bty = 'n', type = 'n', xaxt = 'n', yaxt = 'n')
+text(x = 0.5, y = 0.5, paste("Non-target\nclauses"), cex = 1.6, col = "black")
+MyRadPlot(c[,,'NonTarget']['down',], radial.lim=c(0, max(c[,,'NonTarget'])), main='Downward stories')
+MyRadPlot(c[,,'NonTarget']['up',], radial.lim=c(0, max(c[,,'NonTarget'])), main='Upward stories')
+MyRadPlot(c[,,'NonTarget']['left',], radial.lim=c(0, max(c[,,'NonTarget'])), main='Leftward stories')
+MyRadPlot(c[,,'NonTarget']['right',], radial.lim=c(0, max(c[,,'NonTarget'])), main='Rightward stories')
+
+```
+
+```{r singleDirectionChanceBootstrappedRates, cache=FALSE}
+clusterExport(cl, 'direction.var')
+
+emp.up <- Congruity(msg[msg[[direction.var]] == 'up',]) # emp congruity
+boot.up <- BootSingleDirection(msg,'up') # chance distribution
+
+emp.down <- Congruity(msg[msg[[direction.var]] == 'down',])
+boot.down <- BootSingleDirection(msg,'down')
+
+emp.left <- Congruity(msg[msg[[direction.var]] == 'left',])
+boot.left <- BootSingleDirection(msg,'left')
+
+emp.right <- Congruity(msg[msg[[direction.var]] == 'right',])
+boot.right <- BootSingleDirection(msg,'right')
+
+```
+
+In all four story directions, participants gestured congruently with the story direction more often than would be expected by chance. Upward stories had a `r round(emp.up, 3) * 100`% observed rate of congruity (chance rate = `r ReportBootstrap(emp.up,boot.up)`%, `r ReportOddsRatio(msg,'up')`. Downward stories had a `r round(emp.down, 3) * 100`% observed rate of congruity (chance rate = `r ReportBootstrap(emp.up,boot.down)`%, `r ReportOddsRatio(msg,'down')`. Leftward stories had a `r round(emp.left, 3) * 100`% observed rate of congruity (chance rate = `r ReportBootstrap(emp.left,boot.left)`%, `r ReportOddsRatio(msg,'left')`. Rightward stories had a `r round(emp.right, 3) * 100`% observed rate of congruity (chance rate = `r ReportBootstrap(emp.right,boot.right)`%, `r ReportOddsRatio(msg,'right')`.
+
+### Congruity across literal, metaphorical, and non-spatial stories
+
+``` {r OneWayPermLanguageTypes, cache=FALSE} 
+
+permVar.dist <- OnewayPermTest(msg, 'Input.Lang')
+
+```
+
+In this section, we'll want to include the 'one-way ANOVA' across all three language types, as well as pairwise permutation tests. Also, include tests of whether congruity is greater than chance in each language type.
+
+We randomly permuted the language types within each participant, and computed the variance of the mean congruity across language types. The observed variance was `r round(GroupVar(msg,'Input.Lang'),4)*100`%, which was significantly greater than the permuted chance variance `r ReportOnewayPerm(GroupVar(msg,'Input.Lang'), permVar.dist)`.
+
+``` {r pairwisediffChanceCongrutiyLanguageTypes, cache=FALSE}
+
+permMLPair <- WithinSubsCongPairwisePermute(msg,'Input.Lang','MSL','LSL') 
+permNLPair <- WithinSubsCongPairwisePermute(msg,'Input.Lang','NSL','LSL')
+permMNPair <- WithinSubsCongPairwisePermute(msg,'Input.Lang','MSL','NSL') 
+
+```
+
+### Pairwise differences in congruity between language types
+We performed three separate permutation tests (k=10,000, each) between each pair of language types. We randomly permuted the story directions within each participant, and computed the pairwise differences in congruity. Congruity was higher in LSL than in MSL (`r PairwiseDiffHelper(msg,'Input.Lang','MSL','LSL')`, chance rate = `r ReportPermute(PairwiseDiffHelper(msg,'Input.Lang','MSL','LSL'),permMLPair)`, higher in NSL than in LSL (`r PairwiseDiffHelper(msg,'Input.Lang','NSL','LSL')`, chance rate = `r ReportPermute(PairwiseDiffHelper(msg,'Input.Lang','NSL','LSL'),permNLPair)`, and higher in NSL than in MSL (`r PairwiseDiffHelper(msg,'Input.Lang','MSL','LSL')`, chance rate = `r ReportPermute(PairwiseDiffHelper(msg,'Input.Lang','MSL','NSL'),permMNPair)`.
+
+``` {r chanceCongruityLanguageTypes, cache=FALSE}
+
+permLSL.dist <- WithinSubsCongPermute(subset(msg,Input.Lang == 'LSL'))
+permMSL.dist <- WithinSubsCongPermute(subset(msg,Input.Lang == 'MSL'))
+permNSL.dist <- WithinSubsCongPermute(subset(msg,Input.Lang == 'NSL'))  
+
+```
+
+### Congruity in each language type
+We performed within-subjects permutations (k=10,000) to test whether congruity within each language type was greater than would be expected by chance. Participants produced congruent gestures more often than would be expected by chance in all three language types: LSL: `r round(Congruity(subset(msg, Input.Lang=='LSL')), 3) * 100`% congruent  (chance rate = `r ReportPermute(Congruity(subset(msg, Input.Lang=='LSL')), permLSL.dist)`); MSL: `r round(Congruity(subset(msg, Input.Lang=='MSL')), 3) * 100`% congruent (chance rate =  `r ReportPermute(Congruity(subset(msg, Input.Lang=='MSL')), permMSL.dist)`) , and NSL: `r round(Congruity(subset(msg, Input.Lang=='NSL')), 3) * 100`% congruent (chance rate =  `r ReportPermute(Congruity(subset(msg, Input.Lang=='NSL')), permNSL.dist)`).
+
+``` {r chanceCongruityClauseTypes, cache=FALSE}
+
+# Pairwise difference in congruity between clauses
+permClausePair <- WithinSubsCongPairwisePermute(msg,'Target.NonTarget','Target','NonTarget')
+
+# Within-sub congruity in each type of clause
+permTarget.dist <- WithinSubsCongPermute(subset(msg,Target.NonTarget == 'Target'))
+permNonTarget.dist <- WithinSubsCongPermute(subset(msg,Target.NonTarget == 'NonTarget'))
+
+```
+
+### Congruity according to the presence of a directional meaning
+Congruity was higher in Target than in Non-target clauses (`r PairwiseDiffHelper(msg,'Target.NonTarget','Target','NonTarget')`, chance rate = `r ReportPermute(PairwiseDiffHelper(msg,'Target.NonTarget','Target','NonTarget'),permClausePair)`.Participants produced congruent gestures greater than would be expected by chance in both types of clauses: Target clauses: `r round(Congruity(subset(msg, Target.NonTarget=='Target')), 3) * 100`% congruent  (chance rate = `r ReportPermute(Congruity(subset(msg, Target.NonTarget=='Target')), permTarget.dist)`); Non-target clauses: `r round(Congruity(subset(msg, Target.NonTarget=='NonTarget')), 3) * 100`% congruent  (chance rate = `r ReportPermute(Congruity(subset(msg, Target.NonTarget=='NonTarget')), permNonTarget.dist)`).
